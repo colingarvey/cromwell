@@ -99,10 +99,8 @@ public class S3FileStore extends FileStore implements Comparable<S3FileStore> {
     }
 
     private Bucket getBucket(String bucketName) {
-        for (Bucket buck : getClient().listBuckets().buckets())
-            if (buck.name().equals(bucketName))
-                return buck;
-        return null;
+        Bucket buck = Bucket.builder().name(bucketName).build();
+        return buck;
     }
 
     private boolean hasBucket(String bucketName) {

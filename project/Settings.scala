@@ -68,6 +68,7 @@ object Settings {
     assembly / assemblyJarName := name.value + "-" + version.value + ".jar",
     assembly / test := {},
     assembly / assemblyMergeStrategy := customMergeStrategy.value,
+    assembly / assemblyCacheOutput := false
   )
 
   val Scala2_13Version = "2.13.9"

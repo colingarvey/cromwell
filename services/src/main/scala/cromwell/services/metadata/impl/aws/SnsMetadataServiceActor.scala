@@ -36,7 +36,7 @@ import akka.actor.{Actor, ActorLogging, ActorRef, Props}
 import com.typesafe.config.Config
 import cromwell.cloudsupport.aws.AwsConfiguration
 import cromwell.core.Dispatcher.ServiceDispatcher
-import cromwell.services.metadata.{MetadataEvent, MetadataValue}
+import cromwell.services.metadata.{MetadataEvent}
 import cromwell.services.metadata.MetadataService.{MetadataWriteFailure, MetadataWriteSuccess, PutMetadataAction, PutMetadataActionAndRespond}
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain
 import software.amazon.awssdk.regions.Region
@@ -45,7 +45,7 @@ import software.amazon.awssdk.services.sns.model.PublishRequest
 import spray.json.enrichAny
 
 import scala.concurrent.{ExecutionContextExecutor, Future}
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Success, Try}
 
 
 /**
@@ -60,6 +60,10 @@ class AwsSnsMetadataServiceActor(serviceConfig: Config, globalConfig: Config, se
 
   //setup sns client
   val topicArn: String = serviceConfig.getString("aws.topicArn")
+  val publishStatusOnly: Boolean = Try(serviceConfig.getBoolean("aws.publishStatusOnly")) match {
+    case Failure(_) => false
+    case Success(value) => value
+  }
 
   val awsConfig: AwsConfiguration = AwsConfiguration(globalConfig)
   val credentialsProviderChain: AwsCredentialsProviderChain =
@@ -73,7 +77,7 @@ class AwsSnsMetadataServiceActor(serviceConfig: Config, globalConfig: Config, se
   def publishMessages(events: Iterable[MetadataEvent]): Future[Unit] = {
     import AwsSnsMetadataServiceActor.EnhancedMetadataEvents
 
-    val eventsJson = events.toJson
+    val eventsJson = events.toJson(publishStatusOnly)
     //if there are no events then don't publish anything
     if( eventsJson.length < 1) { return Future(())}
     log.debug(f"Publishing to $topicArn : $eventsJson")
@@ -123,7 +127,13 @@ object AwsSnsMetadataServiceActor {
 
   implicit class EnhancedMetadataEvents(val e: Iterable[MetadataEvent]) extends AnyVal {
     import cromwell.services.metadata.MetadataJsonSupport._
-
+    def toJson(statusOnly: Boolean): Seq[String] = {
+      if (statusOnly) {
+        e.flatMap(reportStatusOnly).map(_.toJson.toString()).toSeq
+      } else {
+        e.map(_.toJson.toString()).toSeq
+      }
+    }
     def toJson: Seq[String] = e.flatMap(reportStatusOnly).map(_.toJson.toString()).toSeq
   }
 }

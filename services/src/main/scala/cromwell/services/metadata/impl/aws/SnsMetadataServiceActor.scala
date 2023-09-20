@@ -32,12 +32,11 @@
 package cromwell.services.metadata.impl.aws
 
 import java.util.UUID
-
 import akka.actor.{Actor, ActorLogging, ActorRef, Props}
 import com.typesafe.config.Config
 import cromwell.cloudsupport.aws.AwsConfiguration
 import cromwell.core.Dispatcher.ServiceDispatcher
-import cromwell.services.metadata.MetadataEvent
+import cromwell.services.metadata.{MetadataEvent, MetadataValue}
 import cromwell.services.metadata.MetadataService.{MetadataWriteFailure, MetadataWriteSuccess, PutMetadataAction, PutMetadataActionAndRespond}
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain
 import software.amazon.awssdk.regions.Region
@@ -115,10 +114,17 @@ object AwsSnsMetadataServiceActor {
     Props(new AwsSnsMetadataServiceActor(serviceConfig, globalConfig, serviceRegistryActor)).withDispatcher(ServiceDispatcher)
   }
 
+  def reportStatusOnly(event: MetadataEvent): Option[MetadataEvent] = {
+    event.key.key match {
+      case "status" => Some(event)
+      case _ => None
+    }
+  }
+
   implicit class EnhancedMetadataEvents(val e: Iterable[MetadataEvent]) extends AnyVal {
     import cromwell.services.metadata.MetadataJsonSupport._
 
-    def toJson: Seq[String] = e.map(_.toJson.toString()).toSeq
+    def toJson: Seq[String] = e.flatMap(reportStatusOnly).map(_.toJson.toString()).toSeq
   }
 }
 

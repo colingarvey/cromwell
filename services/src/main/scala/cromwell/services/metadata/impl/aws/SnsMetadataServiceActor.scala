@@ -32,11 +32,12 @@
 package cromwell.services.metadata.impl.aws
 
 import java.util.UUID
+
 import akka.actor.{Actor, ActorLogging, ActorRef, Props}
 import com.typesafe.config.Config
 import cromwell.cloudsupport.aws.AwsConfiguration
 import cromwell.core.Dispatcher.ServiceDispatcher
-import cromwell.services.metadata.{MetadataEvent}
+import cromwell.services.metadata.MetadataEvent
 import cromwell.services.metadata.MetadataService.{MetadataWriteFailure, MetadataWriteSuccess, PutMetadataAction, PutMetadataActionAndRespond}
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProviderChain
 import software.amazon.awssdk.regions.Region
@@ -77,7 +78,11 @@ class AwsSnsMetadataServiceActor(serviceConfig: Config, globalConfig: Config, se
   def publishMessages(events: Iterable[MetadataEvent]): Future[Unit] = {
     import AwsSnsMetadataServiceActor.EnhancedMetadataEvents
 
-    val eventsJson = events.toJson(publishStatusOnly)
+    val eventsJson = if (publishStatusOnly) {
+      events.filter(_.key.key == "status").toJson
+    } else {
+      events.toJson
+    }
     //if there are no events then don't publish anything
     if( eventsJson.length < 1) { return Future(())}
     log.debug(f"Publishing to $topicArn : $eventsJson")
@@ -118,23 +123,10 @@ object AwsSnsMetadataServiceActor {
     Props(new AwsSnsMetadataServiceActor(serviceConfig, globalConfig, serviceRegistryActor)).withDispatcher(ServiceDispatcher)
   }
 
-  def reportStatusOnly(event: MetadataEvent): Option[MetadataEvent] = {
-    event.key.key match {
-      case "status" => Some(event)
-      case _ => None
-    }
-  }
-
   implicit class EnhancedMetadataEvents(val e: Iterable[MetadataEvent]) extends AnyVal {
     import cromwell.services.metadata.MetadataJsonSupport._
-    def toJson(statusOnly: Boolean): Seq[String] = {
-      if (statusOnly) {
-        e.flatMap(reportStatusOnly).map(_.toJson.toString()).toSeq
-      } else {
-        e.map(_.toJson.toString()).toSeq
-      }
-    }
-    def toJson: Seq[String] = e.flatMap(reportStatusOnly).map(_.toJson.toString()).toSeq
+
+    def toJson: Seq[String] = e.map(_.toJson.toString()).toSeq
   }
 }
 

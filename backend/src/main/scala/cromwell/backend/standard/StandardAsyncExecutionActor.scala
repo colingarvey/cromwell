@@ -244,6 +244,8 @@ trait StandardAsyncExecutionActor
     }
   }
 
+  lazy val memoryRetryRequested: Boolean = memoryRetryFactor.nonEmpty
+
   /**
     * Returns the shell scripting for finding all files listed within a directory.
     *
@@ -1265,62 +1267,102 @@ trait StandardAsyncExecutionActor
     */
   def handleExecutionResult(status: StandardAsyncRunState,
                             oldHandle: StandardAsyncPendingExecutionHandle): Future[ExecutionHandle] = {
-    
+
+    // Returns true if the task has written an RC file that indicates OOM, false otherwise
+    def memoryRetryRC: Future[Boolean] = {
+      // convert int to boolean
+      def returnCodeAsBoolean(codeAsOption: Option[String]): Boolean = {
+        codeAsOption match {
+          case Some(codeAsString) =>
+            Try(codeAsString.trim.toInt) match {
+              case Success(code) => code match {
+                case StderrContainsRetryKeysCode => true
+                case _ => false
+              }
+              case Failure(e) =>
+                log.error(s"'CheckingForMemoryRetry' action exited with code '$codeAsString' which couldn't be " +
+                  s"converted to an Integer. Task will not be retried with more memory. Error: ${ExceptionUtils.getMessage(e)}")
+                false
+            }
+          case None => false
+        }
+      }
+      // read if the file exists
+      def readMemoryRetryRCFile(fileExists: Boolean): Future[Option[String]] = {
+        if (fileExists)
+          asyncIo.contentAsStringAsync(jobPaths.memoryRetryRC, None, failOnOverflow = false).map(Option(_))
+        else
+          Future.successful(None)
+      }
+      //finally : assign the yielded variable
+      for {
+        fileExists <- asyncIo.existsAsync(jobPaths.memoryRetryRC)
+        retryCheckRCAsOption <- readMemoryRetryRCFile(fileExists)
+        retryWithMoreMemory = returnCodeAsBoolean(retryCheckRCAsOption)
+      } yield retryWithMoreMemory
+    }
+
+    // get the exit code of the job.
+    def JobExitCode: Future[String] = {
+      
+      // read if the file exists
+      def readRCFile(fileExists: Boolean): Future[String] = {
+        if (fileExists)
+          asyncIo.contentAsStringAsync(jobPaths.returnCode, None, failOnOverflow = false)
+        else {
+          jobLogger.warn("RC file not found. Setting job to failed & waiting 5m before retry.")
+          Thread.sleep(300000)
+          Future("1")
+        }
+      }
+      //finally : assign the yielded variable
+      for {
+        fileExists <- asyncIo.existsAsync(jobPaths.returnCode)
+        jobRC <- readRCFile(fileExists)
+      } yield jobRC
+    }
+
     // get path to sderr
     val stderr = jobPaths.standardPaths.error
     lazy val stderrAsOption: Option[Path] = Option(stderr)
-    // get the three needed variables, using helper functions below, or direct assignment.
+    // get the three needed variables, using functions above or direct assignment.
     val stderrSizeAndReturnCodeAndMemoryRetry = for {
       returnCodeAsString <- JobExitCode
       // Only check stderr size if we need to, otherwise this results in a lot of unnecessary I/O that
       // may fail due to race conditions on quickly-executing jobs.
       stderrSize <- if (failOnStdErr) asyncIo.sizeAsync(stderr) else Future.successful(0L)
-      retryWithMoreMemory <- memoryRetryRC(oldHandle.pendingJob)
-    } yield (stderrSize, returnCodeAsString, retryWithMoreMemory)
+      outOfMemoryDetected <- memoryRetryRC
+    } yield (stderrSize, returnCodeAsString, outOfMemoryDetected)
 
     stderrSizeAndReturnCodeAndMemoryRetry flatMap {
-      case (stderrSize, returnCodeAsString, retryWithMoreMemory) =>
+      case (stderrSize, returnCodeAsString, outOfMemoryDetected) =>
         val tryReturnCodeAsInt = Try(returnCodeAsString.trim.toInt)
-        jobLogger.debug(s"Handling execution Result with status '${status.toString()}' and returnCode ${returnCodeAsString}")
+
         if (isDone(status)) {
           tryReturnCodeAsInt match {
-            // stderr not empty : retry
             case Success(returnCodeAsInt) if failOnStdErr && stderrSize.intValue > 0 =>
               val executionHandle = Future.successful(FailedNonRetryableExecutionHandle(StderrNonEmpty(jobDescriptor.key.tag, stderrSize, stderrAsOption), Option(returnCodeAsInt), None))
               retryElseFail(executionHandle)
-            // job was aborted (cancelled by user?) 
-            // on AWS OOM kill are code 137 : check retryWithMoreMemory here 
-            case Success(returnCodeAsInt) if isAbort(returnCodeAsInt) && !retryWithMoreMemory =>
-              jobLogger.debug(s"Job was aborted, code was : '${returnCodeAsString}'")
-              Future.successful(AbortedExecutionHandle)
-            // if instance killed after RC.txt creation : edge case with status == Failed AND returnCode == [accepted values] => retry.
-            case Success(returnCodeAsInt) if status.toString() == "Failed" && continueOnReturnCode.continueFor(returnCodeAsInt) =>
-                jobLogger.debug(s"Suspected spot kill due to status/RC mismatch")
-                val executionHandle = Future.successful(FailedNonRetryableExecutionHandle(UnExpectedStatus(jobDescriptor.key.tag, returnCodeAsInt, status.toString(), stderrAsOption), Option(returnCodeAsInt), None))
-                retryElseFail(executionHandle)
-            // job considered ok by accepted exit code
             case Success(returnCodeAsInt) if continueOnReturnCode.continueFor(returnCodeAsInt) =>
               handleExecutionSuccess(status, oldHandle, returnCodeAsInt)
-            // job failed on out-of-memory : retry
-            case Success(returnCodeAsInt) if retryWithMoreMemory  =>
-              jobLogger.info(s"Retrying job due to OOM with exit code : '${returnCodeAsString}' ")
+            // It's important that we check retryWithMoreMemory case before isAbort. RC could be 137 in either case;
+            // if it was caused by OOM killer, want to handle as OOM and not job abort.
+            case Success(returnCodeAsInt) if outOfMemoryDetected && memoryRetryRequested  =>
               val executionHandle = Future.successful(FailedNonRetryableExecutionHandle(RetryWithMoreMemory(jobDescriptor.key.tag, stderrAsOption, memoryRetryErrorKeys, log), Option(returnCodeAsInt), None))
-              retryElseFail(executionHandle, retryWithMoreMemory)
-            // unaccepted return code : retry.
+              retryElseFail(executionHandle, outOfMemoryDetected)
+            case Success(returnCodeAsInt) if isAbort(returnCodeAsInt) =>
+              Future.successful(AbortedExecutionHandle)
             case Success(returnCodeAsInt) =>
-              jobLogger.debug(s"Retrying with wrong exit code : '${returnCodeAsString}'")
               val executionHandle = Future.successful(FailedNonRetryableExecutionHandle(WrongReturnCode(jobDescriptor.key.tag, returnCodeAsInt, stderrAsOption), Option(returnCodeAsInt), None))
               retryElseFail(executionHandle)
             case Failure(_) =>
-              jobLogger.warn(s"General failure of job with exit code : '${returnCodeAsString}'")
               Future.successful(FailedNonRetryableExecutionHandle(ReturnCodeIsNotAnInt(jobDescriptor.key.tag, returnCodeAsString, stderrAsOption), kvPairsToSave = None))
           }
         } else {
           tryReturnCodeAsInt match {
-            case Success(returnCodeAsInt) if retryWithMoreMemory && !continueOnReturnCode.continueFor(returnCodeAsInt) =>
-              jobLogger.debug(s"job not done but retrying already? : ${status.toString()}")
+            case Success(returnCodeAsInt) if outOfMemoryDetected && memoryRetryRequested && !continueOnReturnCode.continueFor(returnCodeAsInt) =>
               val executionHandle = Future.successful(FailedNonRetryableExecutionHandle(RetryWithMoreMemory(jobDescriptor.key.tag, stderrAsOption, memoryRetryErrorKeys, log), Option(returnCodeAsInt), None))
-              retryElseFail(executionHandle, retryWithMoreMemory)
+              retryElseFail(executionHandle, outOfMemoryDetected)
             case _ =>
               val failureStatus = handleExecutionFailure(status, tryReturnCodeAsInt.toOption)
               retryElseFail(failureStatus)
@@ -1335,61 +1377,7 @@ trait StandardAsyncExecutionActor
         }
     }
   }
-
-  // helper function for handleExecutionResult : get the exit code of the job.
-  def JobExitCode: Future[String] = {
-      
-    // read if the file exists
-    def readRCFile(fileExists: Boolean): Future[String] = {
-      if (fileExists)
-        asyncIo.contentAsStringAsync(jobPaths.returnCode, None, failOnOverflow = false)
-      else {
-        jobLogger.debug("RC file not found. Setting job to failed.")
-        Future("1")
-      }
-    }
-    //finally : assign the yielded variable
-    for {
-      fileExists <- asyncIo.existsAsync(jobPaths.returnCode)
-      jobRC <- readRCFile(fileExists)
-    } yield jobRC
-  }
-
-  // helper function for handleExecutionResult : get the memory retry code.
-  def memoryRetryRC(job: StandardAsyncJob): Future[Boolean] = {
-    // job is used in aws override version. use here to prevent compilation error.
-    log.debug(s"Looking for memoryRetry in job '${job.jobId}'")
-    // convert int to boolean
-    def returnCodeAsBoolean(codeAsOption: Option[String]): Boolean = {
-      codeAsOption match {
-        case Some(codeAsString) =>
-          Try(codeAsString.trim.toInt) match {
-            case Success(code) => code match {
-              case StderrContainsRetryKeysCode => true
-              case _ => false
-            }
-            case Failure(e) =>
-              log.error(s"'CheckingForMemoryRetry' action exited with code '$codeAsString' which couldn't be " +
-                s"converted to an Integer. Task will not be retried with more memory. Error: ${ExceptionUtils.getMessage(e)}")
-              false
-          }
-        case None => false
-      }
-    }
-    // read if the file exists
-    def readMemoryRetryRCFile(fileExists: Boolean): Future[Option[String]] = {
-      if (fileExists)
-        asyncIo.contentAsStringAsync(jobPaths.memoryRetryRC, None, failOnOverflow = false).map(Option(_))
-      else
-        Future.successful(None)
-    }
-    //finally : assign the yielded variable
-    for {
-      fileExists <- asyncIo.existsAsync(jobPaths.memoryRetryRC)
-      retryCheckRCAsOption <- readMemoryRetryRCFile(fileExists)
-      retryWithMoreMemory = returnCodeAsBoolean(retryCheckRCAsOption)
-    } yield retryWithMoreMemory
-  }
+  
 
 
   /**

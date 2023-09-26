@@ -84,12 +84,14 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
                              parameters: Seq[AwsBatchParameter],
                              configRegion: Option[Region],
                              optAwsAuthMode: Option[AwsAuthMode] = None,
-                             fsxMntPoint: Option[List[String]]
+                             fsxMntPoint: Option[List[String]],
+                             efsMntPoint: Option[String],
+                             efsMakeMD5: Option[Boolean],
+                             efsDelocalize: Option[Boolean]
                             ) {
 
 
   val Log: Logger = LoggerFactory.getLogger(AwsBatchJob.getClass)
-
   //this will be the "folder" that scripts will live in (underneath the script bucket)
   val scriptKeyPrefix = "scripts/"
 
@@ -121,7 +123,9 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
     //working in a mount will cause collisions in long running workers
     val replaced = commandScript.replace(AwsBatchWorkingDisk.MountPoint.pathAsString, workDir)
     val insertionPoint = replaced.indexOf("\n", replaced.indexOf("#!")) +1 //just after the new line after the shebang!
-
+    // load the config
+    val conf : Config = ConfigFactory.load();
+    
     /* generate a series of s3 copy statements to copy any s3 files into the container. */
     val inputCopyCommand = inputs.map {
       case input: AwsBatchFileInput if input.s3key.startsWith("s3://") && input.s3key.endsWith(".tmp") =>
@@ -131,23 +135,32 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
            |sed -i 's#${AwsBatchWorkingDisk.MountPoint.pathAsString}#$workDir#g' $workDir/${input.local}
            |""".stripMargin
 
-
-      case input: AwsBatchFileInput if input.s3key.startsWith("s3://") =>
+      
+      case input: AwsBatchFileInput if input.s3key.startsWith("s3://") => 
+        // regular s3 objects : download to working dir.
         s"_s3_localize_with_retry ${input.s3key} ${input.mount.mountPoint.pathAsString}/${input.local}"
           .replace(AwsBatchWorkingDisk.MountPoint.pathAsString, workDir)
 
-      case input: AwsBatchFileInput =>
+      
+       
+      case input: AwsBatchFileInput if efsMntPoint.isDefined && input.s3key.startsWith(efsMntPoint.get) =>  
+        // EFS located file : test for presence on provided path.
+        Log.debug("EFS input file detected: "+ input.s3key + " / "+ input.local.pathAsString)
+        s"test -e ${input.s3key} || (echo 'input file: ${input.s3key} does not exist' && exit 1)"
+      
+      case input: AwsBatchFileInput => 
+        // an entry in 'disks' => keep mount as it is.. 
         //here we don't need a copy command but the centaurTests expect us to verify the existence of the file
-        val filePath = s"${input.mount.mountPoint.pathAsString}/${input.local.pathAsString}"
-          .replace(AwsBatchWorkingDisk.MountPoint.pathAsString, workDir)
-
-        s"test -e $filePath || echo 'input file: $filePath does not exist' && exit 1"
-
+        //val filePath = s"${input.mount.mountPoint.pathAsString}/${input.local.pathAsString}"
+        //  .replace(AwsBatchWorkingDisk.MountPoint.pathAsString, workDir)
+        val filePath = input.local.pathAsString
+        Log.debug("input entry in disks detected "+ input.s3key + " / "+ input.local.pathAsString)
+        s"test -e $filePath || (echo 'input file: $filePath does not exist' && exit 1)"
+      
       case _ => ""
     }.toList.mkString("\n")
 
     // get multipart threshold from config.
-    val conf : Config = ConfigFactory.load();
     val mp_threshold : Long = if (conf.hasPath("engine.filesystems.s3.MultipartThreshold") ) conf.getMemorySize("engine.filesystems.s3.MultipartThreshold").toBytes() else 5L * 1024L * 1024L * 1024L; 
     Log.debug(s"MultiPart Threshold for delocalizing is $mp_threshold")
 
@@ -246,7 +259,8 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
          |  b=$$(( 5 * 1024 * 1024 ))
          |  chunk_size=$$(( a > b ? a : b ))
          |  echo $$chunk_size
-         }
+         |}
+         |
          |function _check_data_integrity() {
          |  local local_path=$$1
          |  local s3_path=$$2
@@ -263,7 +277,7 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
          |  s3_content_length=$$($awsCmd s3api head-object --bucket "$$bucket" --key "$$key" --query 'ContentLength') || 
          |        { echo "Attempt to get head of object failed for $$s3_path." && return 1 ; }
          |  # local
-         |  local_content_length=$$(LC_ALL=C ls -dn -- "$$local_path" | awk '{print $$5; exit}' ) || 
+         |  local_content_length=$$(LC_ALL=C ls -dnL -- "$$local_path" | awk '{print $$5; exit}' ) || 
          |        { echo "Attempt to get local content length failed for $$_local_path." && return 1; }   
          |  # compare
          |  if [[ "$$s3_content_length" -eq "$$local_content_length" ]]; then
@@ -290,28 +304,113 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
 
     //generate a series of s3 commands to delocalize artifacts from the container to storage at the end of the task
     val outputCopyCommand = outputs.map {
+      // local is relative path, no mountpoint disk in front.
       case output: AwsBatchFileOutput if output.local.pathAsString.contains("*") => "" //filter out globs
-      case output: AwsBatchFileOutput if output.name.endsWith(".list") && output.name.contains("glob-") =>
-
+      case output: AwsBatchFileOutput if output.s3key.endsWith(".list") && output.s3key.contains("glob-") =>
+        Log.debug("Globbing  : check for EFS settings.")
         val s3GlobOutDirectory = output.s3key.replace(".list", "")
+        // glob paths are not generated with 127 char limit, using generateGlobPaths(). name can be used safely 
         val globDirectory = output.name.replace(".list", "")
         /*
          * Need to process this list and de-localize each file if the list file actually exists
          * if it doesn't exist then 'touch' it so that it can be copied otherwise later steps will get upset
          * about the missing file
          */
-        s"""
-           |touch ${output.name}
-           |_s3_delocalize_with_retry ${output.name} ${output.s3key}
-           |if [ -e $globDirectory ]; then _s3_delocalize_with_retry $globDirectory $s3GlobOutDirectory ; fi""".stripMargin
+        if ( efsMntPoint.isDefined && output.mount.mountPoint.pathAsString == efsMntPoint.get ) {
+           Log.debug("EFS glob output file detected: "+ output.s3key + s" / ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}")
+           val test_cmd = if (efsDelocalize.isDefined && efsDelocalize.getOrElse(false)) {
+                    Log.debug("delocalization on EFS is enabled")
+                    Log.debug(s"Delocalizing $globDirectory to $s3GlobOutDirectory\n")
+                    s"""
+                        |touch ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}
+                        |_s3_delocalize_with_retry ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString} ${output.s3key}
+                        |if [ -e $globDirectory ]; then _s3_delocalize_with_retry $globDirectory $s3GlobOutDirectory ; fi
+                        |""".stripMargin
+                } else {
+                    
+                    // check file for existence
+                    s"""
+                        |# test the glob list
+                        |test -e ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString} || (echo 'output file: ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString} does not exist' && exit 1)
+                        |# test individual files.
+                        |for F in $$(cat ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}); do
+                        |   test -e "${globDirectory}/$$F" || (echo 'globbed file: "${globDirectory}/$$F" does not exist' && exit 1)
+                        |done
+                        |"""
+                }
+           // need to make md5sum? 
+           val md5_cmd = if (efsMakeMD5.isDefined && efsMakeMD5.getOrElse(false)) {
+                    Log.debug("Add cmd to create MD5 sibling.")
+                    // this does NOT regenerate the md5 in case the file is overwritten ! 
+                    s"""
+                        |if [[ ! -f '${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}.md5' ]] ; then 
+                        |   # the glob list
+                        |   md5sum '${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}' > '${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}.md5' || (echo 'Could not generate ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}.md5' && exit 1 ); 
+                        |   # globbed files, using specified number of cpus for parallel processing.
+                        |   cat ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString} | xargs -I% -P${runtimeAttributes.cpu.##.toString} bash -c "md5sum ${globDirectory}/% > ${globDirectory}/%.md5"
+                        |fi
+                        |""".stripMargin 
+                } else {
+                    Log.debug("MD5 not enabled: "+efsMakeMD5.get.toString())
+                    ""
+                }
+           // return combined result
+           s"""
+          |${test_cmd}
+          |${md5_cmd}
+          | """.stripMargin
+        } else {
+          // default delocalization command.
+          Log.debug(s"Delocalize from ${output.name} to ${output.s3key}\n")
+          s"""
+             |touch ${output.name}
+             |_s3_delocalize_with_retry ${output.name} ${output.s3key}
+             |if [ -e $globDirectory ]; then _s3_delocalize_with_retry $globDirectory $s3GlobOutDirectory ; fi""".stripMargin
+        }
 
-
+      // files on /cromwell/ working dir must be delocalized
       case output: AwsBatchFileOutput if output.s3key.startsWith("s3://") && output.mount.mountPoint.pathAsString == AwsBatchWorkingDisk.MountPoint.pathAsString =>
         //output is on working disk mount
+        Log.debug("output Data on working disk mount" + output.local.pathAsString)
         s"""_s3_delocalize_with_retry $workDir/${output.local.pathAsString} ${output.s3key}""".stripMargin
 
+      // file(name (full path), s3key (delocalized path), local (file basename), mount (disk details))
+      // files on EFS mounts are optionally delocalized. 
+      case output: AwsBatchFileOutput if efsMntPoint.isDefined && output.mount.mountPoint.pathAsString == efsMntPoint.get =>  
+        Log.debug("EFS output file detected: "+ output.s3key + s" / ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}")
+        // EFS located file : test existence or delocalize.
+        var test_cmd = ""
+        if (efsDelocalize.isDefined && efsDelocalize.getOrElse(false)) {
+            Log.debug("efs-delocalization enabled")
+            test_cmd = s"_s3_delocalize_with_retry ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString} ${output.s3key}"
+        } else {
+            Log.debug("efs-delocalization disabled")
+            // check file for existence
+            test_cmd = s"test -e ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString} || (echo 'output file: ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString} does not exist' && exit 1)"
+        }
+        // need to make md5sum? 
+        var md5_cmd = ""
+        if (efsMakeMD5.isDefined && efsMakeMD5.getOrElse(false)) {
+            Log.debug("Add cmd to create MD5 sibling.")
+            md5_cmd = s"""
+                            |if [[ ! -f '${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}.md5' ]] ; then 
+                            |   md5sum '${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}' > '${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}.md5' || (echo 'Could not generate ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString}.md5' && exit 1 ); 
+                            |fi
+                            |""".stripMargin 
+        } else {
+            Log.debug("MD5 not enabled: "+efsMakeMD5.get.toString())
+            md5_cmd = ""
+        } 
+        // return combined result
+        s"""
+          |${test_cmd}
+          |${md5_cmd}
+          | """.stripMargin
+      
       case output: AwsBatchFileOutput =>
         //output on a different mount
+        Log.debug("output data on other mount")
+        Log.debug(output.toString)
         s"_s3_delocalize_with_retry ${output.mount.mountPoint.pathAsString}/${output.local.pathAsString} ${output.s3key}"
       case _ => ""
     }.mkString("\n") + "\n" +
@@ -423,7 +522,7 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
   private def findOrCreateS3Script(commandLine :String, scriptS3BucketName: String) :String = {
 
     val bucketName = scriptS3BucketName
-
+    // this is md5 digest of the script contents ( == commandLine)
     val key = MessageDigest.getInstance("MD5")
       .digest(commandLine.getBytes())
       .foldLeft("")(_ + "%02x".format(_))
@@ -437,7 +536,7 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
         .bucket(bucketName)
         .key( scriptKeyPrefix + key )
         .build
-      ).eTag().equals(key)
+      ).eTag().equals(key) // as key is the md5 of script content, and script is small (<8mb) => key should be equal to eTag if the file exists.
 
       // if there's no exception then the script already exists
       Log.debug(s"""Found script $bucketName/$scriptKeyPrefix$key""")
@@ -485,7 +584,11 @@ final case class AwsBatchJob(jobDescriptor: BackendJobDescriptor, // WDL/CWL
         jobPaths = jobPaths,
         inputs = inputs,
         outputs = outputs,
-        fsxMntPoint = fsxMntPoint)
+        fsxMntPoint = fsxMntPoint,
+        efsMntPoint = efsMntPoint,
+        efsMakeMD5 = efsMakeMD5,
+        efsDelocalize = efsDelocalize
+        )
 
       val jobDefinitionBuilder = StandardAwsBatchJobDefinitionBuilder
       val jobDefinition = jobDefinitionBuilder.build(jobDefinitionContext)

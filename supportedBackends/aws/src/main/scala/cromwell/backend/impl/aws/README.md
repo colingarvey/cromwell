@@ -29,6 +29,21 @@ defined.
 This infrastructure and all the associated configuration still exists; however,
 it is moved out of the Cromwell configuration.
 
+Deployment
+----------
+
+Deployment of the cromwell/AWS environment can be performed using the three cloudformation stacks:
+
+1. VPC : setup of the networks
+2. Resources : setup of the compute environment, job queues and storage solutions
+3. Cromwell : setup of an EC2 instance and RDS, hosting the cromwell server and submission tools. 
+
+Along the way, all necessary IAM rols are generated. 
+
+The full documentation is available [here](DEPLOY.md)
+
+
+
 Features
 ---------------------
 ### Docker Hub Authentication
@@ -42,7 +57,7 @@ Docker Hub authentication for AWS Backend enable users to access and use private
 dockerhub { token = "<enconded-string-from-point-2>" }
 ```
 
-Stack must be deployed through https://github.com/aws-samples/aws-genomics-workflows.
+
 
 ### `awsBatchRetryAttempts`
 
@@ -154,11 +169,9 @@ backend {
 }
 
 // set the keys for Out-Of-Memory killing. 
-// system.io.memory-retry-error-keys
-system{
-    io{
-        memory-retry-error-keys = ["OutOfMemory","Killed"]
-    }
+// system.memory-retry-error-keys
+system {
+    memory-retry-error-keys = ["OutOfMemory","Killed"]
 }
 ```
 
@@ -166,6 +179,14 @@ Workflow specific runtime options : `workflow_options.json`:
 ```
 {
     "memory_retry_multiplier" : 1.5
+}
+```
+
+Or specify it in the cromwell config as : 
+
+```
+workflow-options {
+    memory-retry-multiplier = 1.5
 }
 ```
 
@@ -250,6 +271,210 @@ services {
 }
 ```
 2. Add `events:PutEvents` IAM policy to your Cromwell server IAM role. 
+
+
+#### AWS EFS
+
+Cromwell EC2 instances can be equipped with a shared elastic filesystem, termed EFS. Using this filesystem for intermediate data bypasses the need to pass these files around between the cromwell jobs and S3. 
+
+1.  Setup an EFS filesystem: 
+
+Following the [GenomicsWorkFlows](https://docs.opendata.aws/genomics-workflows/orchestration/cromwell/cromwell-overview.html) deployment stack and selecting "Create EFS", you will end up with an EFS filesystem accessible within the provided subnets. It is mounted by default in EC2 workers under /mnt/efs. This is specified in the launch templates USER_DATA if you want to change this. *BEWARE* : For globbing to work on EFS, the mountpoint must be left as "/mnt/efs" ! 
+
+Next, it is recommended to change the EFS setup (in console : select EFS service, then the "SharedDataGenomics" volume, edit). Change performance settings to Enhanced/Elastic, because the bursting throughput is usually insufficient. Optionally set the lifecycle to archive infrequently accessed data and reduce costs. 
+
+2. Set Cromwell Configuration
+
+The following directives need to be added to the cromwell configuration:
+
+```
+backend {
+    providers {
+        AWSBatch {
+            config{
+                // ALTER THE GLOBBING COMMAND: 
+                // use symlinks instad of hardlinks (not allowed on EFS)
+                //  "shopt -s nullglob" prevents issues with empty globbed folders.  
+                glob-link-command = " shopt -s nullglob; ln -fs GLOB_PATTERN GLOB_DIRECTORY "
+
+                default-runtime-attributes {
+                    // keep you other settings as they are (queueArn etc)
+
+                    // DEFAULT EFS CONFIG
+                    // delocalize output files under /mnt/efs to the cromwell tmp bucket
+                    efsDelocalize = false
+                    // make sibling-md5 files of output files under /mnt/efs as part of the job. see local.caching!
+                    efsMakeMD5 = false
+                }
+                filesystems {
+                    s3 {
+                        // your s3 settings should remain as they are
+                    }
+                    // add the local directive
+                    local {
+                        // the mountpoint of the EFS volume within the HOST (specified in EC2 launch template)
+                        efs = "/mnt/efs"
+                        caching {
+                            // sibling-md5 files reduce traffic on the EFS share. By default, files are streamed & hashed in cromwell itself
+                            // NOTE: beware on overwriting files. the md5-siblings are not automatically cleaned up or updated !! 
+                            check-sibling-md5 : true
+                        }
+                    }
+
+                }
+            }
+        }
+    }
+}
+
+```
+
+Now, Cromwell is able to : 
+
+- take input from localized files in temp-bucket (default) 
+- take input from files stored on EFS (no localization performed) 
+- generate output files located in the cromwell working directory : delocalized to S3 tmp bucket
+- generate output files located on the EFS volume : checked for presence, kept, and optionally delocalized
+- generate sibling md5 files for default output files and globbed output files
+- detect valid cached job outputs from previous runs, both on S3/tmp-bucket and EFS, for single files and globbed files. 
+
+Note: generating sibling md5 files for globbed output utilized the amount of vCPUs specified for the job.
+
+3. Current limitations:
+
+- There is no unique temp/scratch folder generated per workflow ID. Data collision prevention is left to the user. 
+- Cleanup must be done manually
+- Globbing only works if efs is mounted under "/mnt/efs" (see config above)
+
+4. Example Workflow
+
+The following workflow highlights the following features: 
+ 
+ - take input data from an s3 bucket. 
+ - generate & keep intermediate data on efs
+ - glob files on s3
+ - delocalize output from efs volume to s3
+ - read a file on efs in the main wdl cromwell process.
+
+ 
+```
+version 1.0
+workflow TestEFS {
+    input {
+        # input file for WF is located on a public S3
+        File s3_file = 's3://cromwell-aws-cloudformation-templates/root-templates/aws-vpc.template.yaml'
+        # set an input parameter holding the working dir on EFS
+        String efs_wd = "/mnt/efs/MyTestProject"
+    }
+    # task one : create a file and a glob on efs. do not delocalize
+    call task_one {input:
+        infile = s3_file,
+        wd = efs_wd    
+    }
+    # read the outfile on EFS straight in a wdl structure
+    Array[Array[String]] step1_info = read_tsv(task_one.efs_file)
+
+    # task two : reuse the file on the wd and delocalize to s3 (via runtime setting)
+    call task_two {input:
+        wd = efs_wd,
+        infile = task_one.efs_file
+    }
+    Array[Array[String]] step2_info = read_tsv(task_two.outfile)
+
+    # run a task on the various files (get md5).
+    call task_three {input:
+        wd = efs_wd,
+        infiles = task_one.file_list,
+        f = task_two.outfile
+    }
+    Array[String] step3_md5s = task_three.md5
+
+    ## outputs
+    output{
+        Array[Array[String]] wf_out_info_step1 = step1_info
+        File wf_out_efs_file = task_one.efs_file
+        File wf_out_s3_file = task_one.s3_file
+        Array[File] wf_out_globList_out = task_one.file_list
+
+        File wf_out_file_step2 = task_two.outfile
+        Array[String] wf_out_step3 = step3_md5s    
+    }
+}
+
+task task_one {
+    input {
+	    File infile
+        String wd
+    }
+    command {
+        # mk the wd:
+        mkdir -p ~{wd}/StuffToGlob
+        # create files
+        for i in A B C D E F G H I F K L M N O P Q R; do 
+            echo $i > ~{wd}/StuffToGlob/$i.txt
+        done
+        # mv the infile to wd
+        mv ~{infile} ~{wd}/
+        # generate an outfile for output Testing on EFS
+        ls -alh ~{wd} > ~{wd}/MyOutFile
+        # and on the temp bucket.
+        ls -alh ~{wd} > MyRegularS3File.txt
+    }
+     runtime {
+        docker: "ubuntu:22.04"
+        cpu : "1"
+        memory: "500M"         
+     }
+     output {
+        File efs_file = '~{wd}/MyOutFile'
+        File s3_file = "MyRegularS3File.txt"
+        Array[File] file_list = glob("~{wd}/StuffToGlob/*.txt")
+     }   
+}
+
+task task_two {
+    input {
+        String wd
+        File infile
+    }
+    command {
+        # another derived file:
+        ls -alh /tmp > ~{infile}.step2
+    }
+     runtime {
+        docker: "ubuntu:22.04"
+        cpu : "1"
+        memory: "500M" 
+        efsDelocalize: true
+        
+     }
+     output {
+        File outfile = "~{infile}.step2"
+     }   
+}
+
+task task_three {
+    input {
+        String wd
+        Array[File] infiles
+        File f
+    }
+    command {    
+        #get checksums for globbed + extra infile
+        md5sum ~{sep=' ' infiles} ~{f}
+    }
+    runtime {
+        docker: "ubuntu:22.04"
+        cpu : "1"
+        memory: "500M"         
+     }
+     output {
+        Array[String] md5 = read_lines(stdout())
+     }
+}
+```
+
+
 
 
 AWS Batch
